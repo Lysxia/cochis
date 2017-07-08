@@ -1,20 +1,32 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE ViewPatterns #-}
 
 module Cochis where
 
 import Control.Applicative
 import Control.Monad
+import Control.Monad.Except
 import Control.Monad.Trans.Maybe
 import Data.Foldable
 import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import GHC.Generics
+import GHC.Stack
 import Lens.Micro
 import Unbound.Generics.LocallyNameless
 
 import Cochis.Types
+
+data TypeError = TypeError CallStack String String
+  deriving Show
+
+typeError
+  :: (MonadError TypeError m, HasCallStack, Show l)
+  => l -> String -> m a
+typeError l = throwError . TypeError ?callStack (show l)
 
 data Ctx
   = CtxNil
@@ -36,8 +48,8 @@ newEVar CtxNil vt = CtxE (rebind vt CtxNil)
 newEVar (CtxT (unrebind -> (a1, ctx))) vt = CtxT (rebind a1 (newEVar ctx vt))
 newEVar (CtxE (unrebind -> (vt1, ctx))) vt = CtxE (rebind vt1 (newEVar ctx vt))
 
-lookupEVar :: Alternative m => Ctx -> Name E -> m (Embed T)
-lookupEVar CtxNil _ = empty
+lookupEVar :: MonadError TypeError m => Ctx -> Name E -> m (Embed T)
+lookupEVar CtxNil v = typeError v "Unbound variable"
 lookupEVar (CtxT (unrebind -> (_, ctx))) v = lookupEVar ctx v
 lookupEVar (CtxE (unrebind -> ((v1, t1), ctx))) v
   | v1 == v = pure t1
@@ -48,18 +60,18 @@ tyCtx CtxNil = []
 tyCtx (CtxT (unrebind -> (a1, ctx))) = a1 : tyCtx ctx
 tyCtx (CtxE (unrebind -> (_, ctx))) = tyCtx ctx
 
-typeCheck :: (Alternative m, Fresh m) => Ctx -> ICtx -> E -> m T
+typeCheck :: (MonadError TypeError m, Fresh m) => Ctx -> ICtx -> E -> m T
 typeCheck ctx ictx e = case e of
   Var v -> fmap unembed (lookupEVar ctx v)
   Abs b -> do
     (vt@(_, Embed t0), e1) <- unbind b
-    guard (closedType (tyCtx ctx) t0)
+    assertClosedType e (tyCtx ctx) t0
     t1 <- typeCheck (newEVar ctx vt) ictx e1
     return (TyFun t0 t1)
   App e0 e1 -> do
     TyFun t1 t2 <- typeCheck ctx ictx e0
     t1' <- typeCheck ctx ictx e1
-    guard (t1 `aeq` t1')
+    assertEqualTypes e t1 t1'
     return t2
   TAbs b -> do
     (a0, e1) <- unbind b
@@ -67,31 +79,31 @@ typeCheck ctx ictx e = case e of
     return (TyAll (bind a0 t1))
   TApp e0 t1 -> do
     TyAll b <- typeCheck ctx ictx e0
-    guard (closedType (tyCtx ctx) t1)
+    assertClosedType e (tyCtx ctx) t1
     (a1, t0) <- unbind b
     return (subst a1 t1 t0)
   IAbs t0 e1 -> do
-    guard (closedType (tyCtx ctx) t0)
+    assertClosedType e (tyCtx ctx) t0
     unamb [] t0
     t1 <- typeCheck ctx (t0 : ictx) e1
     return (TyIFun t0 t1)
   IApp e0 e1 -> do
     TyIFun t1 t2 <- typeCheck ctx ictx e0
     t1' <- typeCheck ctx ictx e1
-    guard (t1 `aeq` t1')
+    assertEqualTypes e t1 t1'
     return t2
   IQuery t0 -> do
-    guard (closedType (tyCtx ctx) t0)
+    assertClosedType e (tyCtx ctx) t0
     unamb [] t0
     resolve (tyCtx ctx) ictx t0
     return t0
 
-typeCheck0 :: E -> Maybe T
+typeCheck0 :: MonadError TypeError m => E -> m T
 typeCheck0 = runFreshMT . typeCheck CtxNil []
 
 -- | In the paper, the stable rule seems to be using a type variable
 -- environment @as@ which remains constant.
-resolve :: (Alternative m, Fresh m) => [Name T] -> ICtx -> T -> m ()
+resolve :: (MonadError TypeError m, Fresh m) => [Name T] -> ICtx -> T -> m ()
 resolve as ictx t = case t of
   TyAll b -> do
     (_, t1) <- unbind b
@@ -102,20 +114,21 @@ resolve as ictx t = case t of
     resolve' (resolve as ictx) as ictx t
 
 resolve'
-  :: (Alternative m, Fresh m)
+  :: (MonadError TypeError m, Fresh m)
   => (T -> m ())
   -> [Name T]
   -> ICtx
   -> T
   -> m ()
 resolve' k as ictx t = case ictx of
-  [] -> empty
+  [] -> typeError t "No match found."
   t' : ictx' -> do
     subgoals <- runMaybeT (match t' t)
     case subgoals of
       Nothing -> resolve' k as ictx' t
       Just (s, ts) -> do
-        guard (all self (Map.toList s))  -- Check that the substitution is trivial.
+        unless (all self (Map.toList s)) $  -- Check that the substitution is trivial.
+          typeError (t, s) "Incoherent match."
         for_ ts k
   where
     self (a, TyVar a') | a == a' = True
@@ -191,7 +204,7 @@ monoType t = case t of
   TyCon _ -> True
   _ -> False
 
-unamb :: (Alternative m, Fresh m) => [Name T] -> T -> m ()
+unamb :: (MonadError TypeError m, Fresh m) => [Name T] -> T -> m ()
 unamb as t = case t of
   TyAll b -> do
     (a0, t1) <- unbind b
@@ -200,7 +213,20 @@ unamb as t = case t of
     unamb [] t0
     unamb as t1
   t ->
-    guard (Set.fromList as `Set.isSubsetOf` Set.fromList (t ^.. fv))
+    unless (Set.fromList as `Set.isSubsetOf` Set.fromList (t ^.. fv)) $
+      typeError t "Ambiguous type."
 
 closedType :: [Name T] -> T -> Bool
 closedType as t = Set.fromList (t ^.. fv) `Set.isSubsetOf` Set.fromList as
+
+assertClosedType
+  :: (Show e, MonadError TypeError m)
+  => e -> [Name T] -> T -> m ()
+assertClosedType e as t =
+  unless (closedType as t) $ typeError e "Type has unbound variables."
+
+assertEqualTypes
+  :: (Show e, MonadError TypeError m)
+  => e -> T -> T -> m ()
+assertEqualTypes e t1 t1' =
+  unless (t1 `aeq` t1') $ typeError e "Mismatched types."
