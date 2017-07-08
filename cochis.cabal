@@ -20,6 +20,7 @@ library
     Cochis.Parser
     Cochis.Printer
     Cochis.Types
+    Cochis.Utils
   other-modules:
     Cochis.Parser.Patterns
   build-depends:

@@ -37,6 +37,9 @@ pattern HsIAbs t e = App (App (LitVar "implicit") (TypeApp t)) e
 pattern HsTyIFun :: Type -> Type -> Type
 pattern HsTyIFun t0 t1 = TyInfix t0 (LitSym "~>") t1
 
+pattern HsTyCon :: String -> Type
+pattern HsTyCon c = TyCon (UnQual (Ident c))
+
 pattern HsDecl :: Name -> Exp -> Decl
 pattern HsDecl name e = PatBind (PVar name) (UnGuardedRhs e) Nothing
 

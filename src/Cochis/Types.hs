@@ -22,6 +22,7 @@ data T
   | TyFun T T
   | TyAll (Bind (Name T) T)
   | TyIFun T T
+  | TyCon String
   deriving (Show, Generic)
 
 instance Alpha E

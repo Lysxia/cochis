@@ -14,6 +14,9 @@ import Cochis.Types
 
 type Name' = Hs.Name
 
+prettyPrint :: Hs.Pretty a => a -> String
+prettyPrint = Hs.prettyPrint
+
 printMod :: [(Name', E)] -> String
 printMod = Hs.prettyPrint . toModule
 
@@ -53,6 +56,7 @@ toType (TyAll b) = do
   t' <- toType t
   return (Hs.TyForall (Just [Hs.UnkindedVar (toName a)]) Nothing t')
 toType (TyIFun t0 t1) = toArrow HsTyIFun t0 t1
+toType (TyCon c) = return (HsTyCon c)
 
 toArrow :: Fresh m => (Type -> Type -> b) -> T -> T -> m b
 toArrow f t0 t1 = do
@@ -60,6 +64,7 @@ toArrow f t0 t1 = do
   let
     t0' = case t0 of
       TyVar _ -> t0_
+      TyCon _ -> t0_
       _ -> Hs.TyParen t0_
   t1' <- toType t1
   return (f t0' t1')

@@ -86,6 +86,9 @@ typeCheck ctx ictx e = case e of
     resolve (tyCtx ctx) ictx t0
     return t0
 
+typeCheck0 :: E -> Maybe T
+typeCheck0 = runFreshMT . typeCheck CtxNil []
+
 -- | In the paper, the stable rule seems to be using a type variable
 -- environment @as@ which remains constant.
 resolve :: (Alternative m, Fresh m) => [Name T] -> ICtx -> T -> m ()
@@ -150,6 +153,7 @@ unify' rename (TyVar a) t'
       (Set.intersection
         (Set.fromList (Map.elems rename))
         (Set.fromList (t' ^.. fv)))
+unify' _ (TyCon c) (TyCon c') | c == c' = pure Map.empty
 unify' _ _ _ = empty
 
 mergeSubWith :: (Ord k, Applicative f) => (a -> a -> f a) -> Map k a -> Map k a -> f (Map k a)
@@ -184,6 +188,7 @@ monoType :: T -> Bool
 monoType t = case t of
   TyFun t0 t1 -> monoType t0 && monoType t1
   TyVar _ -> True
+  TyCon _ -> True
   _ -> False
 
 unamb :: (Alternative m, Fresh m) => [Name T] -> T -> m ()

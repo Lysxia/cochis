@@ -87,6 +87,7 @@ fromType (Hs.TyForall (Just as') Nothing t) | Just as <- unkinded as' = desugar 
       return (TyAll (bind (fromName a) t'))
 fromType (HsTyIFun t0 t1) =
   liftA2 TyIFun (fromType t0) (fromType t1)
+fromType (HsTyCon c) = return (TyCon c)
 fromType t = error (Hs.prettyPrint t)
 
 unParen :: Pat -> Pat
