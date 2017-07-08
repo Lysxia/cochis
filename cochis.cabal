@@ -20,6 +20,8 @@ library
     Cochis.Parser
     Cochis.Printer
     Cochis.Types
+  other-modules:
+    Cochis.Parser.Patterns
   build-depends:
     containers,
     haskell-src-exts-simple,

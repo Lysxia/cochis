@@ -1,59 +1,68 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 module Cochis.Printer where
 
 import Control.Applicative
-import Language.Haskell.Exts.Simple hiding
-  (Name, name, Var, App, TyVar, IAbs)
+import Language.Haskell.Exts.Simple
+  ( Module, Decl, Exp, Type )
 import qualified Language.Haskell.Exts.Simple as Hs
 import Unbound.Generics.LocallyNameless
 
+import Cochis.Parser.Patterns
 import Cochis.Types
 
 type Name' = Hs.Name
 
 printMod :: [(Name', E)] -> String
-printMod = prettyPrint . toModule
+printMod = Hs.prettyPrint . toModule
 
 toModule :: [(Name', E)] -> Module
-toModule ds = Module Nothing [] [] (fmap toDecl ds)
+toModule ds = Hs.Module Nothing [] [] (fmap toDecl ds)
 
 toDecl :: (Name', E) -> Decl
-toDecl (name, e) = PatBind (PVar name) (UnGuardedRhs (runFreshM (toExp e))) Nothing
+toDecl (name, e) = HsDecl name (runFreshM (toExp e))
 
 toExp :: Fresh m => E -> m Exp
 toExp (Abs b) = do
   ((v, Embed t), e) <- unbind b
   e' <- toExp e
   t' <- toType t
-  return (Paren (Hs.Lambda [PParen (PatTypeSig (PVar (toName v)) t')] e'))
+  return (Hs.Paren (Hs.Lambda
+    [Hs.PParen (Hs.PatTypeSig (Hs.PVar (toName v)) t')]
+    e'))
 toExp (App e1 e2) = liftA2 Hs.App (toExp e1) (toExp e2)
-toExp (Var v) = return (Hs.Var (UnQual (toName v)))
+toExp (Var v) = return (HsVar (toName v))
 toExp (TAbs b) = do
   (a, e) <- unbind b
   e' <- toExp e
-  return (Paren (Hs.ExpTypeSig
-    e'
-    (TyForall (Just [UnkindedVar (toName a)]) Nothing (TyWildCard Nothing))))
+  return (Hs.Paren (HsTAbs [toName a] e'))
 toExp (TApp e t) = do
   e' <- toExp e
   t' <- toType t
-  return (Hs.App e' (Hs.TypeApp t'))
-toExp (IQuery t) = do
-  t' <- toType t
-  return (Hs.ExpTypeSig ExprHole t')
-toExp (IAbs t e) = do
-  t' <- toType t
-  e' <- toExp e
-  return (Hs.App (Hs.App (Hs.Var (UnQual (Ident "implicit"))) (TypeApp t')) e')
-toExp (IApp e0 e1) = do
-  e0' <- toExp e0
-  e1' <- toExp e1
-  return (Hs.App (Hs.App (Hs.Var (UnQual (Ident "with"))) e1') e0')
+  return (HsTApp e' t')
+toExp (IQuery t) = fmap HsIQuery (toType t)
+toExp (IAbs t e) = liftA2 HsIAbs (toType t) (toExp e)
+toExp (IApp e0 e1) = liftA2 HsIApp (toExp e0) (toExp e1)
 
 toType :: Fresh m => T -> m Type
 toType (TyVar v) = return (Hs.TyVar (toName v))
-toType t = error (show t)
+toType (TyFun t0 t1) = toArrow Hs.TyFun t0 t1
+toType (TyAll b) = do
+  (a, t) <- unbind b
+  t' <- toType t
+  return (Hs.TyForall (Just [Hs.UnkindedVar (toName a)]) Nothing t')
+toType (TyIFun t0 t1) = toArrow HsTyIFun t0 t1
+
+toArrow :: Fresh m => (Type -> Type -> b) -> T -> T -> m b
+toArrow f t0 t1 = do
+  t0_ <- toType t0
+  let
+    t0' = case t0 of
+      TyVar _ -> t0_
+      _ -> Hs.TyParen t0_
+  t1' <- toType t1
+  return (f t0' t1')
 
 toName :: Name a -> Hs.Name
-toName = Ident . name2String
+toName = Hs.Ident . name2String
