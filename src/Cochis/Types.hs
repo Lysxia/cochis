@@ -39,4 +39,5 @@ instance Subst T T where
   isvar (TyVar v) = Just (SubstName v)
   isvar _ = Nothing
 
-
+instance Subst T E where
+  isvar _ = Nothing

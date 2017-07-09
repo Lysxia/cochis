@@ -15,7 +15,9 @@ main = do
     putStrLn (prettyPrint name)
     case typeCheck0 e of
       Left e -> print e
-      Right t -> putStrLn (prettyPrint (runFreshM (toType t)))
+      Right (e_, t) -> do
+        putStrLn (prettyPrint (runFreshM (toType t)))
+        putStrLn (printMod [(name, e_)])
 
 unwrap :: (Show e, MonadFail m) => Either e a -> m a
 unwrap (Left e) = fail (show e)
