@@ -24,22 +24,22 @@ toModule :: [(Name', E)] -> Module
 toModule ds = Hs.Module Nothing [] [] (fmap toDecl ds)
 
 toDecl :: (Name', E) -> Decl
-toDecl (name, e) = HsDecl name (runFreshM (toExp e))
+toDecl (name, e) = HsDecl name (runLFreshM (toExp e))
 
-toExp :: Fresh m => E -> m Exp
+toExp :: LFresh m => E -> m Exp
 toExp (Abs b) = do
-  ((v, Embed t), e) <- unbind b
-  e' <- toExp e
-  t' <- toType t
-  return (Hs.Paren (Hs.Lambda
-    [Hs.PParen (Hs.PatTypeSig (Hs.PVar (toName v)) t')]
-    e'))
+  lunbind b $ \((v, Embed t), e) -> do
+    e' <- toExp e
+    t' <- toType t
+    return (Hs.Paren (Hs.Lambda
+      [Hs.PParen (Hs.PatTypeSig (Hs.PVar (toName v)) t')]
+      e'))
 toExp (App e1 e2) = liftA2 Hs.App (toExp e1) (toExp e2)
 toExp (Var v) = return (HsVar (toName v))
 toExp (TAbs b) = do
-  (a, e) <- unbind b
-  e' <- toExp e
-  return (Hs.Paren (HsTAbs [toName a] e'))
+  lunbind b $ \(a, e) -> do
+    e' <- toExp e
+    return (Hs.Paren (HsTAbs [toName a] e'))
 toExp (TApp e t) = do
   e' <- toExp e
   t' <- toType t
@@ -48,17 +48,17 @@ toExp (IQuery t) = fmap HsIQuery (toType t)
 toExp (IAbs t e) = liftA2 HsIAbs (toType t) (toExp e)
 toExp (IApp e0 e1) = liftA2 HsIApp (toExp e0) (toExp e1)
 
-toType :: Fresh m => T -> m Type
+toType :: LFresh m => T -> m Type
 toType (TyVar v) = return (Hs.TyVar (toName v))
 toType (TyFun t0 t1) = toArrow Hs.TyFun t0 t1
 toType (TyAll b) = do
-  (a, t) <- unbind b
-  t' <- toType t
-  return (Hs.TyForall (Just [Hs.UnkindedVar (toName a)]) Nothing t')
+  lunbind b $ \(a, t) -> do
+    t' <- toType t
+    return (Hs.TyForall (Just [Hs.UnkindedVar (toName a)]) Nothing t')
 toType (TyIFun t0 t1) = toArrow HsTyIFun t0 t1
 toType (TyCon c) = return (HsTyCon c)
 
-toArrow :: Fresh m => (Type -> Type -> b) -> T -> T -> m b
+toArrow :: LFresh m => (Type -> Type -> b) -> T -> T -> m b
 toArrow f t0 t1 = do
   t0_ <- toType t0
   let
@@ -70,4 +70,4 @@ toArrow f t0 t1 = do
   return (f t0' t1')
 
 toName :: Name a -> Hs.Name
-toName = Hs.Ident . name2String
+toName = Hs.Ident . show
