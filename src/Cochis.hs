@@ -9,10 +9,14 @@ import Control.Applicative
 import Control.Monad
 import Control.Monad.Except
 import Control.Monad.Trans.Maybe
+import Data.Bimap (Bimap)
+import qualified Data.Bimap as Bimap
 import Data.Foldable
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Data.Set (Set)
 import qualified Data.Set as Set
+import Data.Traversable
 import GHC.Generics
 import GHC.Stack
 import Lens.Micro
@@ -95,15 +99,21 @@ typeCheck ctx ictx e = case e of
   IQuery t0 -> do
     assertClosedType e (tyCtx ctx) t0
     unamb [] t0
-    resolve (tyCtx ctx) ictx t0
+    resolve (Set.fromList (tyCtx ctx)) ictx t0
     return t0
 
 typeCheck0 :: MonadError TypeError m => E -> m T
 typeCheck0 = runFreshMT . typeCheck CtxNil []
 
--- | In the paper, the stable rule seems to be using a type variable
--- environment @as@ which remains constant.
-resolve :: (MonadError TypeError m, Fresh m) => [Name T] -> ICtx -> T -> m ()
+-- We first open all implicit and type abstractions.
+resolve
+  :: (MonadError TypeError m, Fresh m)
+  => Set (Name T)
+  -- ^ Type variables in scope at the point of the query.
+  -- To ensure coherence, we must check that no instantiation of these variables
+  -- may change the outcome of the resolution.
+
+  -> ICtx -> T -> m ()
 resolve as ictx t = case t of
   TyAll b -> do
     (_, t1) <- unbind b
@@ -113,89 +123,141 @@ resolve as ictx t = case t of
   _ ->
     resolve' (resolve as ictx) as ictx t
 
+-- We look for a match in the implicit context.
 resolve'
   :: (MonadError TypeError m, Fresh m)
-  => (T -> m ())
-  -> [Name T]
+  => (T -> m ())   -- ^ Continuation to solve subgoals.
+  -> Set (Name T)  -- ^ Type variables in scope at the point of the query.
   -> ICtx
-  -> T
+  -> T             -- ^ Current goal.
   -> m ()
 resolve' k as ictx t = case ictx of
   [] -> typeError t "No match found."
   t' : ictx' -> do
-    subgoals <- runMaybeT (match t' t)
+    subgoals <- match as t t'
     case subgoals of
       Nothing -> resolve' k as ictx' t
-      Just (s, ts) -> do
-        unless (all self (Map.toList s)) $  -- Check that the substitution is trivial.
-          typeError (t, s) "Incoherent match."
-        for_ ts k
-  where
-    self (a, TyVar a') | a == a' = True
-    self _ = False
+      Just ts -> for_ ts k
 
 type Sub = Map (Name T) T
 
--- | Given @t, t'@, find @s@ such that @substs s t `aeq` t'@.
-unify :: (Alternative m, Fresh m) => T -> T -> m Sub
-unify = unify' Map.empty
+-- | Given @t, t'@, find @s@ such that @substs s t' `aeq` substs s t@,
+-- with some more constraints on @s@...
+unify
+  :: (Alternative m, Fresh m)
+  => Set (Name T)
+  -> Set (Name T)
+  -> T -> T -> m Sub
+unify as es = unify' as es Bimap.empty
 
 unify'
   :: (Alternative m, Fresh m)
-  => Map (Name T) (Name T) -> T -> T -> m Sub
-unify' rename (TyAll b) (TyAll b') = do
-  Just (a, t, a', t') <- unbind2 b b'
-  unify' (Map.insert a a' rename) t t'
-unify' rename (TyIFun t0 t1) (TyIFun t0' t1') = do
-  s0 <- unify' rename t0 t0'
-  s1 <- unify' rename t1 t1'
-  mergeSubWith (\u0 u1 -> guard (u0 `aeq` u1) *> pure u0) s0 s1
-unify' rename (TyFun t0 t1) (TyFun t0' t1') = do
-  s0 <- unify' rename t0 t0'
-  s1 <- unify' rename t1 t1'
-  mergeSubWith (\u0 u1 -> guard (u0 `aeq` u1) *> pure u0) s0 s1
-unify' rename (TyVar a) t'
-  | Just a' <- Map.lookup a rename =
-      case t' of
-        TyVar a0' | a' == a0' -> pure Map.empty
-        _ -> empty
-  | closed = pure (Map.singleton a t')
+  => Set (Name T)
+  -> Set (Name T)
+
+  -> Bimap (Name T) (Name T)
+  -- ^ Name equivalence between @t@ and @t'@.
+  -- Not sure whether 'unbind2' is supposed to generate equal names.
+
+  -> T -> T -> m Sub
+unify' as es nameEq t t' = case (t, t') of
+  (TyAll b, TyAll b') -> do
+    Just (a, t0, a', t0') <- unbind2 b b'
+    let nameEq' = Bimap.insert a a' nameEq
+    unify' as es nameEq' t0 t0'
+
+  (TyIFun t0 t1, TyIFun t0' t1') ->
+    unify2' as es nameEq (t0, t1) (t0', t1')
+
+  (TyFun t0 t1, TyFun t0' t1') ->
+    unify2' as es nameEq (t0, t1) (t0', t1')
+
+  (TyCon c, TyCon c') | c == c' -> pure Map.empty
+
+  (TyVar a, TyVar a')
+    | a == a' -> return Map.empty
+    | (a, a') `Bimap.pairMember` nameEq -> return Map.empty
+    | a `Set.member` as ->
+        if a' `Set.member` as then
+          return (Map.singleton a (TyVar a'))
+        else if a' `Set.member` es then
+          return (Map.singleton a' (TyVar a))
+        else
+          empty
+    | a `Set.member` es ->
+        if a' `Set.member` as || a' `Set.member` es then
+          return (Map.singleton a (TyVar a'))
+        else
+          empty
+
+  (TyVar a, t) -> unifyVar' as es a t
+  (t, TyVar a) -> unifyVar' as es a t
+
+  _ -> empty
+
+unify2'
+  :: (Alternative m, Fresh m)
+  => Set (Name T)
+  -> Set (Name T)
+  -> Bimap (Name T) (Name T)
+  -> (T, T) -> (T, T) -> m Sub
+unify2' as es nameEq (t0, t1) (t0', t1') = do
+  s0 <- unify' as es nameEq t0 t0'
+  let substs0 = substs_ s0
+  s1 <- unify' as es nameEq (substs0 t1) (substs0 t1')
+  return (fmap (substs_ s1) s0 `Map.union` s1)
+
+substs_ :: Subst b a => Map (Name b) b -> a -> a
+substs_ = substs . Map.toList
+
+unifyVar'
+  :: (Alternative m, Monad m, Alpha a)
+  => Set (Name T) -> Set (Name T) -> Name T -> a -> m (Map (Name T) a)
+unifyVar' as es a t
+  | member a && all (\a' -> member a' && a /= a') (t ^.. fv) =
+      return (Map.singleton a t)
   | otherwise = empty
   where
-    closed = Set.null
-      (Set.intersection
-        (Set.fromList (Map.elems rename))
-        (Set.fromList (t' ^.. fv)))
-unify' _ (TyCon c) (TyCon c') | c == c' = pure Map.empty
-unify' _ _ _ = empty
+    member a = a `Set.member` as || a `Set.member` es
 
-mergeSubWith :: (Ord k, Applicative f) => (a -> a -> f a) -> Map k a -> Map k a -> f (Map k a)
-mergeSubWith m as as' =
-  fmap Map.fromAscList (mergeWith m (Map.toAscList as) (Map.toAscList as'))
+-- If the candidate matches, return @Just@ a list of subgoals.
+-- If there is a potential incoherence, throw a type error.
+-- Otherwise, return @Nothing@.
+match
+  :: (Fresh m, MonadError TypeError m)
+  => Set (Name T)
+  -> T  -- ^ Current goal.
+  -> T  -- ^ Match candidate.
+  -> m (Maybe [T])
+match as t t' = match' as [] [] t t'
 
-mergeWith :: (Ord k, Applicative f) => (a -> a -> f a) -> [(k, a)] -> [(k, a)] -> f [(k, a)]
-mergeWith _ [] as = pure as
-mergeWith _ as [] = pure as
-mergeWith m aas0@((k0, a0) : as0) aas1@((k1, a1) : as1) = case compare k0 k1 of
-  EQ -> liftA2 (\a as -> (k0, a) : as) (m a0 a1) (mergeWith m as0 as1)
-  LT -> fmap ((k0, a0) :) (mergeWith m as0 aas1)
-  GT -> fmap ((k1, a1) :) (mergeWith m aas0 as1)
-
-match :: (Alternative m, Fresh m) => T -> T -> m (Sub, [T])
-match t' t = case t' of
+match'
+  :: (Fresh m, MonadError TypeError m)
+  => Set (Name T)   -- ^ Type variables in scope at the point of the query.
+  -> [Name T]       -- ^ Unifiable type variables for the match candidate.
+  -> [T]            -- ^ Subgoals generated by the match candidate.
+  -> T              -- ^ Current goal.
+  -> T              -- ^ Match candidate.
+  -> m (Maybe [T])
+match' as es subgs t t' = case t' of
   TyAll b -> do
-    (a, t1') <- unbind b
-    (s, ts) <- match t1' t
-    case Map.lookup a s of
-      Nothing -> empty
-      Just u -> guard (monoType u)
-    return (Map.delete a s, ts)
+    (e, t1') <- unbind b
+    match' as (e : es) subgs t t1'
   TyIFun t0 t1 -> do
-    (s, ts) <- match t1 t  -- In the paper M-IApp adds t0 to ictx (rho1 to Gamma)???
-    return (s, t0 : ts)
-  t' -> do
-    s <- unify t t'
-    return (s, [])
+    -- In the paper M-IApp adds t0 to ictx (rho1 to Gamma)???
+    match' as es (t0 : subgs) t t1
+  _ -> do
+    s_ <- runMaybeT (unify as (Set.fromList es) t t')
+    for s_ $ \s -> do
+      unless (all (idem s) as) $ typeError t "Incoherent match."
+      return [substs_ s t_ | t_ <- subgs]
+
+-- | Check whether a substitution maps a variable to itself.
+idem :: Sub -> Name T -> Bool
+idem s a = case Map.lookup a s of
+  Nothing -> True
+  Just (TyVar a') -> a == a'
+  Just _ -> False
 
 monoType :: T -> Bool
 monoType t = case t of
